@@ -1,0 +1,116 @@
+---
+title: "CV Average VS Aggregate"
+author: "Qi Wang"
+date: "2023/7/29"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Why the formula-based SE is biased
+```{r}
+beta0 = 1
+beta_x = 2
+N_train = 500
+N_external = 100
+
+
+cox_intercept_ests = matrix(0, nrow = N_train, ncol = N_external)
+cox_intercept_ses = matrix(0, nrow = N_train, ncol = N_external)
+# cox_intercept_sw_ses = NULL
+cox_slope_ests = matrix(0, nrow = N_train, ncol = N_external)
+cox_slope_ses = matrix(0, nrow = N_train, ncol = N_external)
+# cox_slope_sw_ses = NULL
+sample_size = 1e4
+
+cox_intercept_cov = NULL
+cox_slope_cov = NULL
+
+
+library(sandwich)
+for(i in 1:N_train){
+  if(i %% 20 == 0) cat(i/N_train, "\n")
+  x = rnorm(n = sample_size)
+  lin_score = exp(beta0 + beta_x * x)
+  y = sapply(lin_score/(1+lin_score), function(p) rbinom(n = 1, size = 1, prob = p))
+  mod = glm(y~x, family = binomial(link = "logit"))
+  
+  cox_intercepts = NULL
+  cox_slopes = NULL
+  for(j in 1:N_external){
+    ext_x = rnorm(n = sample_size)
+    ext_lin_score = exp(beta0 + beta_x * ext_x)
+    ext_y = sapply(ext_lin_score/(1+ext_lin_score), function(p) rbinom(n = 1, size = 1, prob = p))
+  
+    ext_risk = predict(mod, newdata = data.frame(x = ext_x), type = "response")
+  
+    glm_fit = glm(formula = ext_y~1+offset(I(log(ext_risk/(1-ext_risk)))), family = binomial(link="logit"))
+    cox_intercepts[j] = summary(glm_fit)$coefficient["(Intercept)","Estimate"]
+    
+    cox_intercept_ests[i, j] = summary(glm_fit)$coefficient["(Intercept)","Estimate"]
+    cox_intercept_ses[i, j] = summary(glm_fit)$coefficient["(Intercept)","Std. Error"]
+    
+    glm_fit = glm(formula = ext_y~I(log(ext_risk/(1-ext_risk))), family = binomial(link="logit"))
+    cox_slopes[j] = summary(glm_fit)$coefficient["I(log(ext_risk/(1 - ext_risk)))","Estimate"]
+    
+    cox_slope_ests[i, j] = summary(glm_fit)$coefficient["I(log(ext_risk/(1 - ext_risk)))","Estimate"]
+    cox_slope_ses[i, j] = summary(glm_fit)$coefficient["I(log(ext_risk/(1 - ext_risk)))","Std. Error"]
+  }
+  cox_intercept = mean(cox_intercepts)
+  cox_slope = mean(cox_slopes)
+  
+  
+  ext_x = rnorm(n = sample_size)
+  ext_lin_score = exp(beta0 + beta_x * ext_x)
+  ext_y = sapply(ext_lin_score/(1+ext_lin_score), function(p) rbinom(n = 1, size = 1, prob = p))
+
+  ext_risk = predict(mod, newdata = data.frame(x = ext_x), type = "response")
+
+  glm_fit = glm(formula = ext_y~1+offset(I(log(ext_risk/(1-ext_risk)))), family = binomial(link="logit"))
+ 
+  cox_intercept_est = summary(glm_fit)$coefficient["(Intercept)","Estimate"]
+  cox_intercept_se = summary(glm_fit)$coefficient["(Intercept)","Std. Error"]
+  cox_intercept_cov[i] = cox_intercept_est - qnorm(0.975) * cox_intercept_se < cox_intercept &
+    cox_intercept_est + qnorm(0.975) * cox_intercept_se > cox_intercept
+
+  glm_fit = glm(formula = ext_y~I(log(ext_risk/(1-ext_risk))), family = binomial(link="logit"))
+  
+  cox_slope_est = summary(glm_fit)$coefficient["I(log(ext_risk/(1 - ext_risk)))","Estimate"]
+  cox_slope_se = summary(glm_fit)$coefficient["I(log(ext_risk/(1 - ext_risk)))","Std. Error"]
+  cox_slope_cov[i] = cox_slope_est - qnorm(0.975) * cox_slope_se < cox_slope &
+    cox_slope_est + qnorm(0.975) * cox_slope_se > cox_slope
+  
+}
+
+# mean(cox_intercept_ses)
+# median(cox_intercept_ses)
+# mean(cox_intercept_sw_ses)
+# sd(cox_intercepts)
+# 
+# mean(cox_slope_ses)
+# median(cox_slope_ses)
+# mean(cox_slope_sw_ses)
+# sd(cox_slopes)
+
+# mean(cox_intercept_cov)
+# mean(cox_slope_cov)
+
+sd(cox_intercept_ests)
+mean(cox_intercept_ses)
+cox_intercept_formula_se = apply(cox_intercept_ses, MARGIN = 1, mean)
+cox_intercept_real_se = apply(cox_intercept_ests, MARGIN = 1, sd)
+plot((cox_intercept_real_se - cox_intercept_formula_se)/cox_intercept_formula_se,
+     ylab = "Rel. bias of se estimator for intercept")
+
+cox_slope_formula_se = apply(cox_slope_ses, MARGIN = 1, mean)
+cox_slope_real_se = apply(cox_slope_ests, MARGIN = 1, sd)
+plot((cox_slope_real_se - cox_slope_formula_se)/ cox_slope_formula_se,
+     ylab = "Rel. bias of se estimator for slope")
+
+cox_intercept_cov_rate = mean(cox_intercept_cov)
+cox_slope_cov_rate = mean(cox_slope_cov)
+cox_intercept_cov_rate
+cox_slope_cov_rate
+```

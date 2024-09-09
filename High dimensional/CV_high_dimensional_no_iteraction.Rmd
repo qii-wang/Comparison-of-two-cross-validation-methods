@@ -5,10 +5,6 @@ date: "`r Sys.Date()`"
 output: pdf_document
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-```
-
 # Data generation
 ```{r}
 # glm with covariates with non-zero coefficients
@@ -211,7 +207,7 @@ gen_highD_data = function(coefs, N = 173290){
   return(out)
 }
 
-n_iter = 500
+n_iter = 1000
 set.seed(1024)
 for(i in 1:n_iter){
   if(i %% 20 == 0){
@@ -724,4 +720,293 @@ out_AUC %>% write.csv("./Simulation results/Full stratification/elastic net/AUC.
 out_EOR %>% write.csv("./Simulation results/Full stratification/elastic net/EOR.csv", row.names = FALSE)
 out_cali_intc %>% write.csv("./Simulation results/Full stratification/elastic net/Cali_intercept.csv", row.names = FALSE)
 out_cali_slp %>% write.csv("./Simulation results/Full stratification/elastic net/Cali_slope.csv", row.names = FALSE)
+```
+
+
+# XGBoost
+```{r}
+source("funcs_calibrationMetrics.R")
+library(caret)
+library(pROC)
+library(tidyverse)
+library(doParallel)
+library(foreach)
+library(parallel)
+library(xgboost)
+set.seed(1024)
+
+simu_data_folder = "./Simulated data"
+simu_data_files = list.files(simu_data_folder, pattern = ".",
+                             all.files = FALSE, recursive = FALSE,
+                             full.names = TRUE)
+n_iter = length(simu_data_files)
+coefs = readRDS("coefs_no_interaction.rds")
+
+paras = data.frame(num_folds = c(5))
+out_AUC = paras
+
+out_AUC[, c("W0_AUC_byAvg", "W1_AUC_byAvg", "W0_AUC_byAgt", "W1_AUC_byAgt", "W0_AUC_ext", "W1_AUC_ext",
+            "W0_AUC_byAvg_estsd", "W1_AUC_byAvg_estsd", "W0_AUC_byAgt_estsd", "W1_AUC_byAgt_estsd", "W0_AUC_ext_estsd", "W1_AUC_ext_estsd",
+            "W0_AUC_byAvg_sd", "W1_AUC_byAvg_sd", "W0_AUC_byAgt_sd", "W1_AUC_byAgt_sd", "W0_AUC_ext_sd", "W1_AUC_ext_sd")] = 0
+
+
+out_EOR = paras
+out_EOR[, c("W0_EOR_byAvg", "W1_EOR_byAvg", "W0_EOR_byAgt", "W1_EOR_byAgt", "W0_EOR_ext", "W1_EOR_ext",
+            "W0_EOR_byAvg_estsd", "W1_EOR_byAvg_estsd", "W0_EOR_byAgt_estsd", "W1_EOR_byAgt_estsd", "W0_EOR_ext_estsd", "W1_EOR_ext_estsd",
+            "W0_EOR_byAvg_rej_rate", "W1_EOR_byAvg_rej_rate", "W0_EOR_byAgt_rej_rate", "W1_EOR_byAgt_rej_rate", "W0_EOR_ext_rej_rate", "W1_EOR_ext_rej_rate",
+            "W0_EOR_byAvg_sd", "W1_EOR_byAvg_sd", "W0_EOR_byAgt_sd", "W1_EOR_byAgt_sd", "W0_EOR_ext_sd", "W1_EOR_ext_sd")] = 0
+
+out_cali_intc = paras
+out_cali_intc[, c("W0_cali_intc_byAvg", "W1_cali_intc_byAvg", "W0_cali_intc_byAgt", "W1_cali_intc_byAgt", "W0_cali_intc_ext", "W1_cali_intc_ext",
+                  "W0_cali_intc_byAvg_estsd", "W1_cali_intc_byAvg_estsd", "W0_cali_intc_byAgt_estsd", "W1_cali_intc_byAgt_estsd", "W0_cali_intc_ext_estsd", "W1_cali_intc_ext_estsd",
+                  "W0_cali_intc_byAvg_rej_rate", "W1_cali_intc_byAvg_rej_rate", "W0_cali_intc_byAgt_rej_rate", "W1_cali_intc_byAgt_rej_rate", "W0_cali_intc_ext_rej_rate", "W1_cali_intc_ext_rej_rate",
+                  "W0_cali_intc_byAvg_sd", "W1_cali_intc_byAvg_sd", "W0_cali_intc_byAgt_sd", "W1_cali_intc_byAgt_sd", "W0_cali_intc_ext_sd", "W1_cali_intc_ext_sd")] = 0
+
+out_cali_slp = paras
+out_cali_slp[, c("W0_cali_slp_byAvg", "W1_cali_slp_byAvg", "W0_cali_slp_byAgt", "W1_cali_slp_byAgt", "W0_cali_slp_ext", "W1_cali_slp_ext",
+                 "W0_cali_slp_byAvg_estsd", "W1_cali_slp_byAvg_estsd", "W0_cali_slp_byAgt_estsd", "W1_cali_slp_byAgt_estsd", "W0_cali_slp_ext_estsd", "W1_cali_slp_ext_estsd",
+                 "W0_cali_slp_byAvg_rej_rate", "W1_cali_slp_byAvg_rej_rate", "W0_cali_slp_byAgt_rej_rate", "W1_cali_slp_byAgt_rej_rate", "W0_cali_slp_ext_rej_rate", "W1_cali_slp_ext_rej_rate",
+                 "W0_cali_slp_byAvg_sd", "W1_cali_slp_byAvg_sd", "W0_cali_slp_byAgt_sd", "W1_cali_slp_byAgt_sd", "W0_cali_slp_ext_sd", "W1_cali_slp_ext_sd")] = 0
+
+myCluster <- makeCluster(detectCores()-1, type = "PSOCK", outfile="")
+registerDoParallel(myCluster)
+pb = txtProgressBar(min = 1, max = n_iter, style = 3)
+start.t = Sys.time()
+for(i in 1:nrow(paras)){
+  cat("\n", i, "\n")
+  num_folds = paras$num_folds[i]
+  res = foreach(iter=1:n_iter, .combine = 'rbind', .packages = c("caret", "pROC", "tidyverse", "xgboost")) %dopar%{
+    setTxtProgressBar(pb, iter)
+    sim_data = readRDS(paste0("./Simulated data/highD_data", iter, ".rds"))
+    ext_data = readRDS(paste0("./Simulated external data/external_highD_data", iter, ".rds"))
+    N = nrow(sim_data)
+    sim_data_W = ifelse(sim_data$raceBlack + sim_data$raceAsian + sim_data$raceHispanic + sim_data$raceOthers == 0, 1, 0)
+    ext_data_W = ifelse(ext_data$raceBlack + ext_data$raceAsian + ext_data$raceHispanic + ext_data$raceOthers == 0, 1, 0)
+    
+    
+    x_train = sim_data[, -ncol(sim_data)]
+    y_train = sim_data$case
+    x_train_df = model.matrix(~.-1, data = x_train)
+    xgb_df = xgb.DMatrix(data = x_train_df, label = y_train)
+    
+    xgboost_para_tune = expand.grid(max_depth = c(3,5,7),
+                                    test_auc = 0,
+                                    round = 0)
+    scale_pos_weight = sum(1-sim_data$case) / sum(sim_data$case)
+    for(tune_iter in 1:nrow(xgboost_para_tune)){
+      params = list(max_depth = xgboost_para_tune$max_depth[tune_iter])
+      bst = xgb.cv(params = params,,
+                   data = xgb_df, nrounds = 500,
+                   objective = "binary:logistic", early_stopping_rounds = 10,
+                   metrics = "auc",
+                   nfold = 5,
+                   maximize = TRUE,
+                   verbose = FALSE,
+                   scale_pos_weight = scale_pos_weight)
+      xgboost_para_tune$test_auc[tune_iter] = bst$evaluation_log$test_auc_mean[bst$best_iteration]
+      xgboost_para_tune$round[tune_iter] = bst$best_iteration
+    }
+    
+    best_para_id = which.max(xgboost_para_tune$test_auc)
+    best_nrounds = xgboost_para_tune$round[best_para_id]
+    best_maxdepth = xgboost_para_tune$max_depth[best_para_id]
+    
+    full_data_model = xgboost(data = xgb_df,
+                          nrounds = best_nrounds,
+                          max.depth = best_maxdepth,
+                          objective = "binary:logistic",
+                          verbose = FALSE,
+                          scale_pos_weight = scale_pos_weight)
+    
+    
+    ext_data$Y_pred = predict(full_data_model, newdata = model.matrix(~.-1, ext_data[,-ncol(ext_data)]))
+    
+    suppressMessages(ext_auc_obj_W0 <- with(ext_data[which(ext_data_W==0),], auc(case, Y_pred)))
+    suppressMessages(ext_auc_obj_W1 <- with(ext_data[which(ext_data_W==1),], auc(case, Y_pred)))
+    AUC_ext_rep = c(ext_auc_obj_W0[1], ext_auc_obj_W1[1])
+    AUC_estsd_ext_rep = c(sqrt(var(ext_auc_obj_W0)), sqrt(var(ext_auc_obj_W1)))
+    
+    ext_cali_res_W0 = ext_data[which(ext_data_W==0),] %>%
+      calibrationMetrics(risk_var = "Y_pred", weak_cali_ind = FALSE, correlated = FALSE)
+    ext_cali_res_W1 = ext_data[which(ext_data_W==1),] %>%
+      calibrationMetrics(risk_var = "Y_pred", weak_cali_ind = FALSE, correlated = FALSE)
+    
+    group = NULL
+    for(ii in 1:N){
+      if(sim_data_W[ii] == 0 & sim_data$case[ii] == 0) group[ii] = 1
+      else if(sim_data_W[ii] == 0 & sim_data$case[ii] == 1) group[ii] = 2
+      else if(sim_data_W[ii] == 1 & sim_data$case[ii] == 0) group[ii] = 3
+      else group[ii] = 4
+    }
+    CVTrainFolds = createFolds(as.factor(group), k = num_folds, list = TRUE, returnTrain = TRUE)
+    
+    test_Y_true = NULL
+    test_Y_pred = NULL
+    test_W = NULL
+    AUC_byAvg_vec_folds = matrix(0, nrow = num_folds, ncol = 2)
+    EOR_byAvg_vec_folds = matrix(0, nrow = num_folds, ncol = 2)
+    cali_intc_byAvg_vec_folds = matrix(0, nrow = num_folds, ncol = 2)
+    cali_slp_byAvg_vec_folds = matrix(0, nrow = num_folds, ncol = 2)
+    AUC_estsd_byAvg_vec_folds = matrix(0, nrow = num_folds, ncol = 2)
+    EOR_estsd_byAvg_vec_folds = matrix(0, nrow = num_folds, ncol = 2)
+    cali_intc_estsd_byAvg_vec_folds = matrix(0, nrow = num_folds, ncol = 2)
+    cali_slp_estsd_byAvg_vec_folds = matrix(0, nrow = num_folds, ncol = 2)
+    for(cv_iter in 1:num_folds){
+      train_id = CVTrainFolds[[cv_iter]]
+      cv_train_data = sim_data[train_id, ]
+      cv_test_data = sim_data[-train_id, ]
+      cv_test_data_W = sim_data_W[-train_id]
+      test_Y_true = c(test_Y_true, cv_test_data$case)
+      test_W = c(test_W, cv_test_data_W)
+      
+      cv_x_train = cv_train_data[, -ncol(cv_train_data)]
+      cv_y_train = cv_train_data$case
+      cv_x_train_df = model.matrix(~.-1, data = cv_x_train)
+      cv_xgb_df = xgb.DMatrix(data = cv_x_train_df, label = cv_y_train)
+      cv_model = xgboost(data = cv_xgb_df,
+                         nrounds = best_nrounds,
+                         max.depth = best_maxdepth,
+                         objective = "binary:logistic",
+                         verbose = FALSE,
+                         scale_pos_weight = scale_pos_weight)
+      
+      cv_Y_ped = predict(cv_model, newdata = model.matrix(~.-1, cv_test_data[,-ncol(cv_test_data)]))
+      test_Y_pred = c(test_Y_pred, cv_Y_ped)
+      cv_test_data$Y_pred = cv_Y_ped
+      suppressMessages(auc_byAvg_obj_W0 <- with(cv_test_data[which(cv_test_data_W == 0), ], auc(case, Y_pred)))
+      suppressMessages(auc_byAvg_obj_W1 <- with(cv_test_data[which(cv_test_data_W == 1), ], auc(case, Y_pred)))
+      
+      AUC_byAvg_vec_folds[cv_iter, ] = c(auc_byAvg_obj_W0[1], auc_byAvg_obj_W1[1])
+      AUC_estsd_byAvg_vec_folds[cv_iter, ] = c(sqrt(var(auc_byAvg_obj_W0)), sqrt(var(auc_byAvg_obj_W1)))
+      
+      cv_cali_res_W0 = cv_test_data[which(cv_test_data_W == 0), ] %>%
+        calibrationMetrics(risk_var = "Y_pred", weak_cali_ind = FALSE, correlated = FALSE)
+      cv_cali_res_W1 = cv_test_data[which(cv_test_data_W == 1), ] %>%
+        calibrationMetrics(risk_var = "Y_pred", weak_cali_ind = FALSE, correlated = FALSE)
+      
+      EOR_byAvg_vec_folds[cv_iter, ] = c(cv_cali_res_W0$EORatio["EORatio"][[1]], cv_cali_res_W1$EORatio["EORatio"][[1]])
+      cali_intc_byAvg_vec_folds[cv_iter, ] = c(cv_cali_res_W0$cox_intercept["cox_intercept"][[1]], cv_cali_res_W1$cox_intercept["cox_intercept"][[1]])
+      cali_slp_byAvg_vec_folds[cv_iter, ] = c(cv_cali_res_W0$cox_slope["cox_slope"][[1]], cv_cali_res_W1$cox_slope["cox_slope"][[1]])
+      
+      EOR_estsd_byAvg_vec_folds[cv_iter, ] = c(cv_cali_res_W0$EORatio["se_EORatio"][[1]], cv_cali_res_W1$EORatio["se_EORatio"][[1]])
+      cali_intc_estsd_byAvg_vec_folds[cv_iter, ] = c(cv_cali_res_W0$cox_intercept["cox_intercept_se"][[1]], cv_cali_res_W1$cox_intercept["cox_intercept_se"][[1]])
+      cali_slp_estsd_byAvg_vec_folds[cv_iter, ] = c(cv_cali_res_W0$cox_slope["cox_slope_se"][[1]], cv_cali_res_W1$cox_slope["cox_slope_se"][[1]])
+    }
+    AUC_byAvg_rep = colMeans(AUC_byAvg_vec_folds)
+    EOR_byAvg_rep = colMeans(EOR_byAvg_vec_folds)
+    cali_intc_byAvg_rep = colMeans(cali_intc_byAvg_vec_folds)
+    cali_slp_byAvg_rep = colMeans(cali_slp_byAvg_vec_folds)
+    
+    AUC_estsd_byAvg_rep = colMeans(AUC_estsd_byAvg_vec_folds)/sqrt(num_folds)
+    EOR_estsd_byAvg_rep = colMeans(EOR_estsd_byAvg_vec_folds)/sqrt(num_folds)
+    cali_intc_estsd_byAvg_rep = colMeans(cali_intc_estsd_byAvg_vec_folds)/sqrt(num_folds)
+    cali_slp_estsd_byAvg_rep = colMeans(cali_slp_estsd_byAvg_vec_folds)/sqrt(num_folds)
+    
+    all_test_dt = data.frame(W=test_W, case=test_Y_true, Y_pred=test_Y_pred)
+    suppressMessages(auc_byAgt_obj_W0 <- with(all_test_dt %>% filter(W==0), auc(case, Y_pred)))
+    suppressMessages(auc_byAgt_obj_W1 <- with(all_test_dt %>% filter(W==1), auc(case, Y_pred)))
+    
+    AUC_byAgt_rep = c(auc_byAgt_obj_W0[1], auc_byAgt_obj_W1[1])
+    AUC_estsd_byAgt_rep = c(sqrt(var(auc_byAgt_obj_W0)), sqrt(var(auc_byAgt_obj_W1)))
+    
+    cali_res_byAgt_W0 = all_test_dt %>% filter(W==0) %>% calibrationMetrics(risk_var = "Y_pred", weak_cali_ind = FALSE, correlated = FALSE)
+    cali_res_byAgt_W1 = all_test_dt %>% filter(W==1) %>% calibrationMetrics(risk_var = "Y_pred", weak_cali_ind = FALSE, correlated = FALSE)
+    
+    c("AUC_ext_W0"=AUC_ext_rep[1], "AUC_ext_W1"=AUC_ext_rep[2],
+      "AUC_estsd_ext_W0"=AUC_estsd_ext_rep[1], "AUC_estsd_ext_W1"=AUC_estsd_ext_rep[2],
+      
+      "EOR_ext_W0"=ext_cali_res_W0$EORatio["EORatio"][[1]], "EOR_ext_W1"=ext_cali_res_W1$EORatio["EORatio"][[1]],
+      "EOR_estsd_ext_W0"=ext_cali_res_W0$EORatio["se_EORatio"][[1]], "EOR_estsd_ext_W1"=ext_cali_res_W1$EORatio["se_EORatio"][[1]],
+      "EOR_rej_ext_W0"= 1 < ext_cali_res_W0$EORatio["EORatio_cilb"][[1]] | 1 > ext_cali_res_W0$EORatio["EORatio_ciub"][[1]],
+      "EOR_rej_ext_W1"= 1 < ext_cali_res_W1$EORatio["EORatio_cilb"][[1]] | 1 > ext_cali_res_W1$EORatio["EORatio_ciub"][[1]],
+      
+      "cali_intc_ext_W0"=ext_cali_res_W0$cox_intercept["cox_intercept"][[1]], "cali_intc_ext_W1"=ext_cali_res_W1$cox_intercept["cox_intercept"][[1]],
+      "cali_intc_estsd_ext_W0"=ext_cali_res_W0$cox_intercept["cox_intercept_se"][[1]], "cali_intc_estsd_ext_W1"=ext_cali_res_W1$cox_intercept["cox_intercept_se"][[1]],
+      "cali_intc_rej_ext_W0" = 0 < ext_cali_res_W0$cox_intercept["cox_intercept_cilb"][[1]] | 0 > ext_cali_res_W0$cox_intercept["cox_intercept_ciub"][[1]],
+      "cali_intc_rej_ext_W1" = 0 < ext_cali_res_W1$cox_intercept["cox_intercept_cilb"][[1]] | 0 > ext_cali_res_W1$cox_intercept["cox_intercept_ciub"][[1]],
+      
+      "cali_slp_ext_W0"=ext_cali_res_W0$cox_slope["cox_slope"][[1]], "cali_slp_ext_W1"=ext_cali_res_W1$cox_slope["cox_slope"][[1]],
+      "cali_slp_estsd_ext_W0"=ext_cali_res_W0$cox_slope["cox_slope_se"][[1]], "cali_slp_estsd_ext_W1"=ext_cali_res_W1$cox_slope["cox_slope_se"][[1]],
+      "cali_slp_rej_ext_W0" = 1 < ext_cali_res_W0$cox_slope["cox_slope_cilb"][[1]] | 1 > ext_cali_res_W0$cox_slope["cox_slope_ciub"][[1]],
+      "cali_slp_rej_ext_W1" = 1 < ext_cali_res_W1$cox_slope["cox_slope_cilb"][[1]] | 1 > ext_cali_res_W1$cox_slope["cox_slope_ciub"][[1]],
+      
+      "AUC_byAvg_W0"=AUC_byAvg_rep[1], "AUC_byAvg_W1"=AUC_byAvg_rep[2],
+      "AUC_estsd_byAvg_W0"=AUC_estsd_byAvg_rep[1], "AUC_estsd_byAvg_W1"=AUC_estsd_byAvg_rep[2],
+      
+      "EOR_byAvg_W0"=EOR_byAvg_rep[1], "EOR_byAvg_W1"=EOR_byAvg_rep[2],
+      "EOR_estsd_byAvg_W0" = EOR_estsd_byAvg_rep[1], "EOR_estsd_byAvg_W1"=EOR_estsd_byAvg_rep[2],
+      "EOR_rej_byAvg_W0" = 1 < EOR_byAvg_rep[1] - qnorm(0.975) * EOR_estsd_byAvg_rep[1] | 1 > EOR_byAvg_rep[1] + qnorm(0.975) * EOR_estsd_byAvg_rep[1],
+      "EOR_rej_byAvg_W1" = 1 < EOR_byAvg_rep[2] - qnorm(0.975) * EOR_estsd_byAvg_rep[2] | 1 > EOR_byAvg_rep[2] + qnorm(0.975) * EOR_estsd_byAvg_rep[2],
+      
+      "cali_intc_byAvg_W0"=cali_intc_byAvg_rep[1], "cali_intc_byAvg_W1"=cali_intc_byAvg_rep[2],
+      "cali_intc_estsd_byAvg_W0" = cali_intc_estsd_byAvg_rep[1], "cali_intc_estsd_byAvg_W1"=cali_intc_estsd_byAvg_rep[2],
+      "cali_intc_rej_byAvg_W0" = 0 < cali_intc_byAvg_rep[1] - qnorm(0.975) * cali_intc_estsd_byAvg_rep[1] | 0 > cali_intc_byAvg_rep[1] + qnorm(0.975) * cali_intc_estsd_byAvg_rep[1],
+      "cali_intc_rej_byAvg_W1" = 0 < cali_intc_byAvg_rep[2] - qnorm(0.975) * cali_intc_estsd_byAvg_rep[2] | 0 > cali_intc_byAvg_rep[2] + qnorm(0.975) * cali_intc_estsd_byAvg_rep[2],
+      
+      "cali_slp_byAvg_W0"=cali_slp_byAvg_rep[1], "cali_slp_byAvg_W1"=cali_slp_byAvg_rep[2],
+      "cali_slp_estsd_byAvg_W0" = cali_slp_estsd_byAvg_rep[1], "cali_slp_estsd_byAvg_W1"=cali_slp_estsd_byAvg_rep[2],
+      "cali_slp_rej_byAvg_W0" = 1 < cali_slp_byAvg_rep[1] - qnorm(0.975) * cali_slp_estsd_byAvg_rep[1] | 1 > cali_slp_byAvg_rep[1] + qnorm(0.975) * cali_slp_estsd_byAvg_rep[1],
+      "cali_slp_rej_byAvg_W1" = 1 < cali_slp_byAvg_rep[2] - qnorm(0.975) * cali_slp_estsd_byAvg_rep[2] | 1 > cali_slp_byAvg_rep[2] + qnorm(0.975) * cali_slp_estsd_byAvg_rep[2],
+      
+      "AUC_byAgt_W0"=AUC_byAgt_rep[1], "AUC_byAgt_W1"=AUC_byAgt_rep[2],
+      "AUC_estsd_byAgt_W0"=AUC_estsd_byAgt_rep[1], "AUC_estsd_byAgt_W1"=AUC_estsd_byAgt_rep[2],
+      
+      "EOR_byAgt_W0"=cali_res_byAgt_W0$EORatio["EORatio"][[1]], "EOR_byAgt_W1"=cali_res_byAgt_W1$EORatio["EORatio"][[1]],
+      "EOR_estsd_byAgt_W0"=cali_res_byAgt_W0$EORatio["se_EORatio"][[1]], "EOR_estsd_byAgt_W1"=cali_res_byAgt_W1$EORatio["se_EORatio"][[1]],
+      "EOR_rej_byAgt_W0"= 1 < cali_res_byAgt_W0$EORatio["EORatio_cilb"][[1]] | 1 > cali_res_byAgt_W0$EORatio["EORatio_ciub"][[1]],
+      "EOR_rej_byAgt_W1"= 1 < cali_res_byAgt_W1$EORatio["EORatio_cilb"][[1]] | 1 > cali_res_byAgt_W1$EORatio["EORatio_ciub"][[1]],
+      
+      "cali_intc_byAgt_W0"=cali_res_byAgt_W0$cox_intercept["cox_intercept"][[1]], "cali_intc_byAgt_W1"=cali_res_byAgt_W1$cox_intercept["cox_intercept"][[1]],
+      "cali_intc_estsd_byAgt_W0"=cali_res_byAgt_W0$cox_intercept["cox_intercept_se"][[1]], "cali_intc_estsd_byAgt_W1"=cali_res_byAgt_W1$cox_intercept["cox_intercept_se"][[1]],
+      "cali_intc_rej_byAgt_W0" = 0 < cali_res_byAgt_W0$cox_intercept["cox_intercept_cilb"][[1]] | 0 > cali_res_byAgt_W0$cox_intercept["cox_intercept_ciub"][[1]],
+      "cali_intc_rej_byAgt_W1" = 0 < cali_res_byAgt_W1$cox_intercept["cox_intercept_cilb"][[1]] | 0 > cali_res_byAgt_W1$cox_intercept["cox_intercept_ciub"][[1]],
+      
+      "cali_slp_byAgt_W0"=cali_res_byAgt_W0$cox_slope["cox_slope"][[1]], "cali_slp_byAgt_W1"=cali_res_byAgt_W1$cox_slope["cox_slope"][[1]],
+      "cali_slp_estsd_byAgt_W0"=cali_res_byAgt_W0$cox_slope["cox_slope_se"][[1]], "cali_slp_estsd_byAgt_W1"=cali_res_byAgt_W1$cox_slope["cox_slope_se"][[1]],
+      "cali_slp_rej_byAgt_W0" = 1 < cali_res_byAgt_W0$cox_slope["cox_slope_cilb"][[1]] | 1 > cali_res_byAgt_W0$cox_slope["cox_slope_ciub"][[1]],
+      "cali_slp_rej_byAgt_W1" = 1 < cali_res_byAgt_W1$cox_slope["cox_slope_cilb"][[1]] | 1 > cali_res_byAgt_W1$cox_slope["cox_slope_ciub"][[1]])
+  }
+  
+  
+  out_AUC[i, c("W0_AUC_byAvg", "W1_AUC_byAvg", "W0_AUC_byAgt", "W1_AUC_byAgt", "W0_AUC_ext", "W1_AUC_ext",
+               "W0_AUC_byAvg_estsd", "W1_AUC_byAvg_estsd", "W0_AUC_byAgt_estsd", "W1_AUC_byAgt_estsd", "W0_AUC_ext_estsd", "W1_AUC_ext_estsd")] = colMeans(res[, c("AUC_byAvg_W0", "AUC_byAvg_W1", "AUC_byAgt_W0", "AUC_byAgt_W1", "AUC_ext_W0", "AUC_ext_W1",
+                                                                                                                                                                   "AUC_estsd_byAvg_W0", "AUC_estsd_byAvg_W1", "AUC_estsd_byAgt_W0", "AUC_estsd_byAgt_W1", "AUC_estsd_ext_W0", "AUC_estsd_ext_W1")])
+  
+  out_AUC[i, c("W0_AUC_byAvg_sd", "W1_AUC_byAvg_sd", "W0_AUC_byAgt_sd", "W1_AUC_byAgt_sd", "W0_AUC_ext_sd", "W1_AUC_ext_sd")] = apply(res[, c("AUC_byAvg_W0", "AUC_byAvg_W1", "AUC_byAgt_W0", "AUC_byAgt_W1", "AUC_ext_W0", "AUC_ext_W1")], MARGIN = 2, sd)
+  
+  out_EOR[i, c("W0_EOR_byAvg", "W1_EOR_byAvg", "W0_EOR_byAgt", "W1_EOR_byAgt", "W0_EOR_ext", "W1_EOR_ext",
+               "W0_EOR_byAvg_estsd", "W1_EOR_byAvg_estsd", "W0_EOR_byAgt_estsd", "W1_EOR_byAgt_estsd", "W0_EOR_ext_estsd", "W1_EOR_ext_estsd",
+               "W0_EOR_byAvg_rej_rate", "W1_EOR_byAvg_rej_rate", "W0_EOR_byAgt_rej_rate", "W1_EOR_byAgt_rej_rate", "W0_EOR_ext_rej_rate", "W1_EOR_ext_rej_rate")] = colMeans(res[, c("EOR_byAvg_W0", "EOR_byAvg_W1", "EOR_byAgt_W0", "EOR_byAgt_W1", "EOR_ext_W0", "EOR_ext_W1",
+                                                                                                                                                                                     "EOR_estsd_byAvg_W0", "EOR_estsd_byAvg_W1", "EOR_estsd_byAgt_W0", "EOR_estsd_byAgt_W1", "EOR_estsd_ext_W0", "EOR_estsd_ext_W1",
+                                                                                                                                                                                     "EOR_rej_byAvg_W0", "EOR_rej_byAvg_W1", "EOR_rej_byAgt_W0", "EOR_rej_byAgt_W1", "EOR_rej_ext_W0", "EOR_rej_ext_W1")])
+  
+  out_EOR[i, c("W0_EOR_byAvg_sd", "W1_EOR_byAvg_sd", "W0_EOR_byAgt_sd", "W1_EOR_byAgt_sd", "W0_EOR_ext_sd", "W1_EOR_ext_sd")] = apply(res[, c("EOR_byAvg_W0", "EOR_byAvg_W1", "EOR_byAgt_W0", "EOR_byAgt_W1", "EOR_ext_W0", "EOR_ext_W1")], MARGIN = 2, sd)
+  
+  out_cali_intc[i, c("W0_cali_intc_byAvg", "W1_cali_intc_byAvg", "W0_cali_intc_byAgt", "W1_cali_intc_byAgt", "W0_cali_intc_ext", "W1_cali_intc_ext",
+                     "W0_cali_intc_byAvg_estsd", "W1_cali_intc_byAvg_estsd", "W0_cali_intc_byAgt_estsd", "W1_cali_intc_byAgt_estsd", "W0_cali_intc_ext_estsd", "W1_cali_intc_ext_estsd",
+                     "W0_cali_intc_byAvg_rej_rate", "W1_cali_intc_byAvg_rej_rate", "W0_cali_intc_byAgt_rej_rate", "W1_cali_intc_byAgt_rej_rate", "W0_cali_intc_ext_rej_rate", "W1_cali_intc_ext_rej_rate")] = colMeans(res[, c("cali_intc_byAvg_W0", "cali_intc_byAvg_W1", "cali_intc_byAgt_W0", "cali_intc_byAgt_W1", "cali_intc_ext_W0", "cali_intc_ext_W1",
+                                                                                                                                                                                                                               "cali_intc_estsd_byAvg_W0", "cali_intc_estsd_byAvg_W1", "cali_intc_estsd_byAgt_W0", "cali_intc_estsd_byAgt_W1", "cali_intc_estsd_ext_W0", "cali_intc_estsd_ext_W1",
+                                                                                                                                                                                                                               "cali_intc_rej_byAvg_W0", "cali_intc_rej_byAvg_W1", "cali_intc_rej_byAgt_W0", "cali_intc_rej_byAgt_W1", "cali_intc_rej_ext_W0", "cali_intc_rej_ext_W1")])
+  
+  out_cali_intc[i, c("W0_cali_intc_byAvg_sd", "W1_cali_intc_byAvg_sd", "W0_cali_intc_byAgt_sd", "W1_cali_intc_byAgt_sd", "W0_cali_intc_ext_sd", "W1_cali_intc_ext_sd")] = apply(res[, c("cali_intc_byAvg_W0", "cali_intc_byAvg_W1", "cali_intc_byAgt_W0", "cali_intc_byAgt_W1", "cali_intc_ext_W0", "cali_intc_ext_W1")], MARGIN = 2, sd)
+  
+  out_cali_slp[i, c("W0_cali_slp_byAvg", "W1_cali_slp_byAvg", "W0_cali_slp_byAgt", "W1_cali_slp_byAgt", "W0_cali_slp_ext", "W1_cali_slp_ext",
+                    "W0_cali_slp_byAvg_estsd", "W1_cali_slp_byAvg_estsd", "W0_cali_slp_byAgt_estsd", "W1_cali_slp_byAgt_estsd", "W0_cali_slp_ext_estsd", "W1_cali_slp_ext_estsd",
+                    "W0_cali_slp_byAvg_rej_rate", "W1_cali_slp_byAvg_rej_rate", "W0_cali_slp_byAgt_rej_rate", "W1_cali_slp_byAgt_rej_rate", "W0_cali_slp_ext_rej_rate", "W1_cali_slp_ext_rej_rate")] = colMeans(res[, c("cali_slp_byAvg_W0", "cali_slp_byAvg_W1", "cali_slp_byAgt_W0", "cali_slp_byAgt_W1", "cali_slp_ext_W0", "cali_slp_ext_W1",
+                                                                                                                                                                                                                        "cali_slp_estsd_byAvg_W0", "cali_slp_estsd_byAvg_W1", "cali_slp_estsd_byAgt_W0", "cali_slp_estsd_byAgt_W1", "cali_slp_estsd_ext_W0", "cali_slp_estsd_ext_W1",
+                                                                                                                                                                                                                        "cali_slp_rej_byAvg_W0", "cali_slp_rej_byAvg_W1", "cali_slp_rej_byAgt_W0", "cali_slp_rej_byAgt_W1", "cali_slp_rej_ext_W0", "cali_slp_rej_ext_W1")])
+  
+  out_cali_slp[i, c("W0_cali_slp_byAvg_sd", "W1_cali_slp_byAvg_sd", "W0_cali_slp_byAgt_sd", "W1_cali_slp_byAgt_sd", "W0_cali_slp_ext_sd", "W1_cali_slp_ext_sd")] = apply(res[, c("cali_slp_byAvg_W0", "cali_slp_byAvg_W1", "cali_slp_byAgt_W0", "cali_slp_byAgt_W1", "cali_slp_ext_W0", "cali_slp_ext_W1")], MARGIN = 2, sd)
+}
+
+end.t = Sys.time()
+cat(end.t - start.t)
+
+close(pb)
+stopCluster(myCluster)
+
+out_AUC %>% write.csv("./Simulation results/Full stratification/XGBoost/AUC.csv", row.names = FALSE)
+out_EOR %>% write.csv("./Simulation results/Full stratification/XGBoost/EOR.csv", row.names = FALSE)
+out_cali_intc %>% write.csv("./Simulation results/Full stratification/XGBoost/Cali_intercept.csv", row.names = FALSE)
+out_cali_slp %>% write.csv("./Simulation results/Full stratification/XGBoost/Cali_slope.csv", row.names = FALSE)
 ```
